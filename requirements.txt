@@ -1,0 +1,18 @@
+# MCP Agent Core Dependencies
+model-context-protocol >= 0.1.0
+google-cloud-storage >= 2.5.0
+google-cloud-bigquery >= 3.0.0
+google-cloud-firestore >= 2.7.0
+google-cloud-secret-manager >= 2.10.0
+python-dotenv >= 1.0.0
+python-json-logger >= 2.0.0
+tenacity >= 8.0.0
+
+# Notes:
+# - Specify exact versions if needed for strict reproducibility (e.g., ==2.5.0).
+# - google-api-core and google-auth are typically installed as transitive dependencies
+#   by the google-cloud-* libraries. No need to list them explicitly unless you
+#   require a very specific version.
+# - This file does not include testing dependencies (like pytest). Those are usually
+#   managed separately (e.g., via pyproject.toml [project.optional-dependencies]
+#   or a requirements-dev.txt).
