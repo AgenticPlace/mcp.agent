@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp_agent"
+version = "1.0.0" # Version bump to 1 0 0 milestone
+description = "Hypothetical MCP Agent for GCP Stateless Context Firestore BQ Jobs Signed URLs"
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License", # Example License
+    "Operating System :: OS Independent",
+    "Development Status :: 4 - Beta", # Promote status slightly
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dependencies = [
+    "model-context-protocol >= 0.1.0",
+    "google-cloud-storage >= 2.5.0",
+    "google-cloud-bigquery >= 3.0.0",
+    "python-dotenv >= 1.0.0",
+    "python-json-logger >= 2.0.0",
+    "google-cloud-secret-manager >= 2.10.0",
+    "tenacity >= 8.0.0",
+    "google-cloud-firestore >= 2.7.0", # Added Firestore
+]
+
+[project.scripts]
+mcp-agent = "mcp_agent.cli:main"
+
+[project.urls]
+"Homepage" = "https://github.com/your_username/mcp_agent" # Example
+
+[project.optional-dependencies]
+test = [
+    "pytest >= 7.0",
+    "pytest-asyncio >= 0.18",
+    "google-cloud-storage[test] >= 2.5.0",
+    "google-cloud-bigquery[test] >= 3.0.0",
+    "google-cloud-firestore[test] >= 2.7.0", # Add if needed
+]
