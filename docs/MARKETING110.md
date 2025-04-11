@@ -63,12 +63,12 @@ Version 1.1.0 builds on the scalable v1.0.0 foundation with enhanced operational
 
 ## Get Started with v1.1.0!
 
-1.  **Prerequisites:** Python 3.9+, GCP Project, Enabled APIs (GCS, BQ, Firestore, Secret Manager), ADC Auth (`gcloud auth ...`), IAM Roles set.
-2.  **Install:** `pip install .` from source (after updating dependencies).
-3.  **Configure:** Set optional `MCP_AGENT_API_KEY_SECRET_NAME` / `MCP_AGENT_API_KEY`, and new optional env vars like `SIGNED_URL_EXPIRY_SECONDS`, `ENABLE_BQ_JOB_CLEANUP` in `.env`.
-4.  **Run Server:** `mcp-agent --tools storage,bigquery --port 8080 [options]`
-5.  **Connect Client:** Use MCP client libraries (ADK, `mcp`) with server connection details.
-6.  **Interact:** Call tools, remembering clients must provide resource IDs and handle Signed URLs / BQ polling logic.
+  **Prerequisites:** Python 3.9+, GCP Project, Enabled APIs (GCS, BQ, Firestore, Secret Manager), ADC Auth (`gcloud auth ...`), IAM Roles set.
+  **Install:** `pip install .` from source (after updating dependencies).
+  **Configure:** Set optional `MCP_AGENT_API_KEY_SECRET_NAME` / `MCP_AGENT_API_KEY`, and new optional env vars like `SIGNED_URL_EXPIRY_SECONDS`, `ENABLE_BQ_JOB_CLEANUP` in `.env`.
+  **Run Server:** `mcp-agent --tools storage,bigquery --port 8080 [options]`
+  **Connect Client:** Use MCP client libraries (ADK, `mcp`) with server connection details.
+  **Interact:** Call tools, remembering clients must provide resource IDs and handle Signed URLs / BQ polling logic.
 
 **Dive Deeper:**
 
@@ -80,12 +80,14 @@ Version 1.1.0 builds on the scalable v1.0.0 foundation with enhanced operational
 ---
 
 > **Status:** `mcp.agent` v1.1.0 is an **Improved Beta**. It adds operational features making it more suitable for advanced testing and internal deployments. However, comprehensive production hardening (advanced security, full monitoring/alerting, load testing) is still recommended. See `PRODUCTION_DEPLOYMENT.md` guidance. Feedback and contributions remain welcome!
-Use code with caution.
-Markdown
-Summary of Marketing Enhancements for v1.1.0:
-Updated version number and tagline to reflect stability focus.
-Refreshed the "Why Use" section to include the new v1.1.0 features (/healthz, basic timing, config, cleanup).
-Updated the "Technical Highlights" section similarly.
-Slightly adjusted the tone to convey incremental improvement and operational readiness.
-Kept the core messaging and structure intact.
-Maintained the prominent disclaimer about Beta status and production hardening needs.
+
+# .prompt
+```txt
+Update version number and tagline
+Refresh "Why Use" section to include the new features
+update "Technical insight"
+adjust tone to convey incremental improvement
+maintain core messaging and structure
+```
+
+
