@@ -20,11 +20,11 @@ dependencies = [
     "model-context-protocol >= 0.1.0",
     "google-cloud-storage >= 2.5.0",
     "google-cloud-bigquery >= 3.0.0",
+    "google-cloud-firestore >= 2.7.0",
     "python-dotenv >= 1.0.0",
     "python-json-logger >= 2.0.0",
     "google-cloud-secret-manager >= 2.10.0",
     "tenacity >= 8.0.0",
-    "google-cloud-firestore >= 2.7.0", # Added Firestore
 ]
 
 [project.scripts]
