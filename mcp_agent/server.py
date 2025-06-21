@@ -1,133 +1,255 @@
-import argparse
 import asyncio
+import json
 import logging
 import sys
-import os
-from typing import Set
-from dotenv import load_dotenv
-from pythonjsonlogger import jsonlogger
+from typing import Set, Optional, Any, Dict, List, Callable, Awaitable
 
-# Attempt relative import first
+from aiohttp import web
+from aiohttp_sse import sse_response
+from mcp import types as mcp_types
+
+# Attempt to import ALL_TOOLS_MAP and FirestoreBqJobStore
 try:
-    from .server import run_stdio_server, run_sse_server
-    from .gcp_tools.storage import get_storage_client
-    from .gcp_tools.bigquery import get_bq_client
-    from .utils import get_secret_manager_client, fetch_secret
-    from .job_store import FirestoreBqJobStore # Use Firestore store
+    from .gcp_tools import ALL_TOOLS_MAP # To be populated later
+    from .job_store import FirestoreBqJobStore # Now available
 except ImportError:
-     # Fallback running script directly
-     import os; sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-     from mcp_agent.server import run_stdio_server, run_sse_server
-     from mcp_agent.gcp_tools.storage import get_storage_client
-     from mcp_agent.gcp_tools.bigquery import get_bq_client
-     from mcp_agent.utils import get_secret_manager_client, fetch_secret
-     from mcp_agent.job_store import FirestoreBqJobStore
+    # This implies a packaging or setup issue if job_store is not found.
+    logger = logging.getLogger("mcp_agent.server_prelim") # Use a distinct logger name for this specific warning
+    logger.critical("Could not import ALL_TOOLS_MAP or FirestoreBqJobStore. Tool dispatch will be severely limited or non-functional.", exc_info=True)
+    ALL_TOOLS_MAP: Dict[str, Callable[..., Awaitable[List[mcp_types.Content]]]] = {}
+    FirestoreBqJobStore = None # Make it None if not imported, so type hints don't break entirely below
 
+logger = logging.getLogger("mcp_agent.server") # Main logger for this module
 
-# --- Configure Logging JSON Formatter ---
-root_logger = logging.getLogger(); logHandler = logging.StreamHandler(sys.stderr)
-formatter = jsonlogger.JsonFormatter('%(asctime)s %(levelname)s %(name)s %(message)s %(pathname)s %(lineno)d')
-logHandler.setFormatter(formatter); root_logger.handlers.clear(); root_logger.addHandler(logHandler)
-root_logger.setLevel(logging.INFO); logger = logging.getLogger("mcp_agent.cli")
-# --- End Logging Setup ---
+# --- Tool Dispatcher ---
+async def dispatch_tool(
+    message: Dict[str, Any],
+    enabled_tools: Set[str], # Currently unused here, logic might be in ALL_TOOLS_MAP population
+    conn_id: str,
+    bq_job_store: Optional[FirestoreBqJobStore] = None,
+    **kwargs: Any # To catch any other args passed from server handlers
+) -> List[mcp_types.Content]:
+    """
+    Dispatches an MCP tool call to the appropriate implementation.
+    """
+    tool_name = message.get("tool_name")
+    arguments = message.get("arguments", {})
 
-# Create instance Firestore store enable pre flight check
-# Note This assumes default Firestore database project
-_firestore_job_store = FirestoreBqJobStore()
+    if not tool_name:
+        logger.warning("Request missing 'tool_name'.", extra={"conn_id": conn_id, "request_message": message})
+        return [mcp_types.TextContent(type="text", text=json.dumps({"status": "error", "message": "Missing tool_name in request."}))]
 
-def parse_args():
-    """Parses command line arguments MCP agent server"""
-    parser = argparse.ArgumentParser(
-        description="Run MCP Agent server GCS BQ v1 0 0 Stateless Firestore BQ Jobs", # Updated
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    parser.add_argument("--tools", type=str, required=True, help="Comma separated storage bigquery")
-    parser.add_argument("--port", type=str, required=True, help="Connection mode stdio or SSE port number")
-    parser.add_argument("--host", type=str, default="127.0.0.1", help="SSE Only Host address Use 0 0 0 0 network access")
-    parser.add_argument("--require-api-key", action='store_true', help="SSE Only Enable API key auth Reads MCP AGENT API KEY SECRET NAME then MCP AGENT API KEY")
-    parser.add_argument("--debug", action="store_true", help="Enable verbose debug logging")
-    return parser.parse_args()
+    if not ALL_TOOLS_MAP: # Check if tool map is empty (e.g. import failed)
+        logger.error("ALL_TOOLS_MAP is empty. Cannot dispatch any tools.", extra={"conn_id": conn_id})
+        return [mcp_types.TextContent(type="text", text=json.dumps({"status": "error", "message": "Tool dispatch mechanism not available."}))]
 
-def main() -> None:
-    """Main entry point mcp agent command line tool"""
-    dotenv_path = load_dotenv() # Load env file early
-    if dotenv_path: logger.info("Loaded env vars from env file", extra={'dotenv_path': dotenv_path})
-    else: logger.info("No env file found")
-    args = parse_args()
-    # --- Setup Logging Level ---
-    log_level = logging.DEBUG if args.debug else logging.INFO # ... set levels ...
-    logging.getLogger("mcp_agent").setLevel(log_level); # ... other logger levels ...
-    if args.debug: logger.debug("Debug logging enabled")
-    else: logging.getLogger("google").setLevel(logging.WARNING); logging.getLogger("mcp").setLevel(logging.INFO)
+    if tool_name not in ALL_TOOLS_MAP:
+        logger.warning(f"Tool '{tool_name}' not recognized or not enabled.", extra={"conn_id": conn_id, "tool_name": tool_name})
+        return [mcp_types.TextContent(type="text", text=json.dumps({"status": "error", "message": f"Tool '{tool_name}' not recognized or not enabled."}))]
 
-    # --- Validate Tools ---
-    try: enabled_tools: Set[str] = set(t.strip().lower() for t in args.tools.split(',') if t.strip())
-    except Exception: logger.critical("Invalid tools format"); sys.exit(1)
-    valid_tools = {"storage", "bigquery"}; invalid_tools = enabled_tools - valid_tools
-    if invalid_tools: logger.critical(f"Invalid tools {invalid_tools} Allowed {valid_tools}"); sys.exit(1)
-    if not enabled_tools: logger.critical("No tools specified"); sys.exit(1)
-    logger.info(f"Configuring mcp agent server v1 0 0", extra={"enabled_tools": list(enabled_tools)})
+    tool_function = ALL_TOOLS_MAP[tool_name]
+    logger.info(f"Dispatching to tool: '{tool_name}'", extra={"conn_id": conn_id, "tool_name": tool_name, "arguments": arguments})
 
-    # --- Determine API Key Secret Manager integration ---
-    api_key_to_use: Optional[str] = None; secret_source: str = "None"
-    if args.port.lower() != "stdio" and args.require_api_key:
-        secret_name_var = os.getenv('MCP_AGENT_API_KEY_SECRET_NAME'); direct_key_var = os.getenv('MCP_AGENT_API_KEY')
-        if secret_name_var:
-            logger.info("Attempting fetch API key Secret Manager", extra={"secret_name": secret_name_var})
-            try:
-                # Fetch secret uses retry internally now
-                api_key_to_use = fetch_secret(secret_name_var)
-                if api_key_to_use: secret_source = "Secret Manager"; logger.info("Successfully fetched API key Secret Manager")
-                else: logger.critical(f"FATAL Failed fetch API key Secret Manager {secret_name_var}"); sys.exit(1)
-            except Exception as sm_err: logger.critical(f"FATAL Error Secret Manager access {sm_err}", exc_info=args.debug); sys.exit(1)
-        elif direct_key_var:
-            logger.info("Using API key MCP AGENT API KEY environment variable"); api_key_to_use = direct_key_var; secret_source = "Environment Variable"
-        else: logger.critical("FATAL require api key flag set but neither secret name nor direct key env var set"); sys.exit(1)
-        logger.info(f"API Key Authentication Enabled Source {secret_source}")
-    elif args.port.lower() != "stdio": logger.info("API Key Authentication Disabled")
-    # --- End API Key Handling ---
-
-    # --- Pre flight Check GCP Clients Add Firestore ---
     try:
-        logger.info("Performing pre flight GCP client initialization check")
-        clients_to_init = []
-        if "storage" in enabled_tools: clients_to_init.append(get_storage_client)
-        if "bigquery" in enabled_tools:
-             clients_to_init.append(get_bq_client)
-             # Add Firestore check if BQ enabled
-             clients_to_init.append(_firestore_job_store._get_db) # Use internal method force init
-        if args.port.lower() != "stdio" and args.require_api_key and os.getenv('MCP_AGENT_API_KEY_SECRET_NAME'):
-             clients_to_init.append(get_secret_manager_client)
-        # Run initializations sequentially allow easier debug failure
-        for init_func in clients_to_init:
-            if asyncio.iscoroutinefunction(init_func): asyncio.run(init_func()) # Run async init checks synchronously startup
-            else: init_func()
-        logger.info("GCP client pre flight check successful")
+        # Pass bq_job_store to the tool function if it's available and the tool might need it.
+        # Individual tools will need to be designed to accept bq_job_store in their **kwargs or explicitly.
+        # For now, we pass it if it's not None.
+        if bq_job_store:
+            response_contents = await tool_function(arguments=arguments, conn_id=conn_id, bq_job_store=bq_job_store, **kwargs)
+        else:
+            response_contents = await tool_function(arguments=arguments, conn_id=conn_id, **kwargs)
+        return response_contents
     except Exception as e:
-        logger.critical("FATAL GCP client check failed", extra={"error": str(e)}, exc_info=args.debug)
-        logger.critical("Check ADC credentials API enablement GCS BQ Firestore SecretManager network IAM roles Firestore User Admin")
-        sys.exit(1)
-    # --- End Pre flight Check ---
+        logger.error(f"Error executing tool '{tool_name}': {e}", exc_info=True, extra={"conn_id": conn_id, "tool_name": tool_name})
+        # Consider using handle_gcp_error from utils if it's a GCP exception
+        return [mcp_types.TextContent(type="text", text=json.dumps({"status": "error", "message": f"Error executing tool '{tool_name}': {str(e)}"}))]
 
-    # --- Start Server ---
-    loop = asyncio.get_event_loop(); main_task = None
-    server_mode = "STDIO" if args.port.lower() == "stdio" else f"SSE on {args.host}:{args.port}"
-    try:
-        if args.port.lower() == "stdio":
-            if args.require_api_key: logger.warning("API key requirement ignored stdio mode")
-            logger.info(f"Starting server {server_mode} mode")
-            main_task = loop.create_task(run_stdio_server(enabled_tools))
-        else: # SSE Mode
+
+# --- STDIO Server Implementation ---
+async def run_stdio_server(
+    enabled_tools: Set[str],
+    bq_job_store: Optional[FirestoreBqJobStore] = None,
+    **kwargs: Any # Catch-all for future parameters
+) -> None:
+    logger.info("Starting STDIO server. Listening on stdin...")
+    # For STDIO, conn_id might be less dynamic unless specified by client in messages.
+    # Using a fixed one for the session.
+    conn_id = "stdio_session_main"
+
+    while True:
+        try:
+            line = await asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline)
+            if not line:
+                logger.info("STDIN closed. Shutting down STDIO server.")
+                break
+            line = line.strip()
+            if not line:
+                continue
+
+            logger.debug(f"Received STDIO message: {line}", extra={"conn_id": conn_id})
             try:
-                port_num = int(args.port); # ... validate port range ...
-                if not (1024 <= port_num <= 65535): raise ValueError("Port out range")
-                logger.info(f"Starting server {server_mode} mode")
-                main_task = loop.create_task(run_sse_server(enabled_tools, args.host, port_num, api_key_to_use))
-            except ValueError as e: logger.critical(f"Invalid port {args.port} {e}"); sys.exit(1)
-        if main_task: loop.run_until_complete(main_task)
-    except KeyboardInterrupt: logger.info("Server interrupted Ctrl C Shutting down")
-    except Exception as e: logger.critical(f"Unexpected error running server {e}", exc_info=args.debug)
-    finally: logger.info("Server shutdown process complete"); sys.exit(0) # Explicit exit
+                message = json.loads(line)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse JSON from STDIO: {line}. Error: {e}", exc_info=True, extra={"conn_id": conn_id})
+                error_response_obj = mcp_types.TextContent(type="text", text=json.dumps({"status": "error", "message": "Invalid JSON message received."}))
+                sys.stdout.write(json.dumps(error_response_obj.model_dump()) + "\n")
+                sys.stdout.flush()
+                continue
 
-if __name__ == "__main__":
-    main()
+            response_contents = await dispatch_tool(
+                message=message,
+                enabled_tools=enabled_tools,
+                conn_id=conn_id,
+                bq_job_store=bq_job_store
+            )
+
+            for content in response_contents:
+                if isinstance(content, mcp_types.Content):
+                    sys.stdout.write(json.dumps(content.model_dump()) + "\n")
+                else: # Should not happen if dispatch_tool returns List[mcp_types.Content]
+                    logger.error(f"Invalid content type from dispatch_tool: {type(content)}", extra={"conn_id": conn_id})
+                    sys.stdout.write(json.dumps(str(content)) + "\n") # Best effort
+            sys.stdout.flush()
+
+        except KeyboardInterrupt:
+            logger.info("STDIO server interrupted by user (Ctrl+C).")
+            break
+        except Exception as e:
+            logger.critical(f"Unexpected error in STDIO server loop: {e}", exc_info=True, extra={"conn_id": conn_id})
+            await asyncio.sleep(1)
+
+    logger.info("STDIO server has shut down.")
+
+
+# --- SSE Server Implementation ---
+@web.middleware
+async def api_key_middleware(request: web.Request, handler: Callable):
+    api_key_required = request.app.get("api_key")
+    # This middleware is only active if api_key_required is not None in app state
+    if api_key_required:
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            logger.warning("SSE request missing or malformed Authorization header.", extra={"remote": request.remote})
+            raise web.HTTPUnauthorized(
+                text=json.dumps({"status": "error", "message": "Missing or malformed Authorization header. Expected 'Bearer <API_KEY>'."}),
+                content_type="application/json"
+            )
+
+        token = auth_header.split("Bearer ")[1]
+        if token != api_key_required:
+            logger.warning("SSE request with invalid API key.", extra={"remote": request.remote})
+            raise web.HTTPForbidden(
+                text=json.dumps({"status": "error", "message": "Invalid API key."}),
+                content_type="application/json"
+            )
+    return await handler(request)
+
+async def handle_mcp_sse_request(request: web.Request):
+    # Generate a somewhat unique connection ID for logging/tracing this request
+    conn_id = request.headers.get("X-Connection-ID") # Allow client to specify
+    if not conn_id:
+        conn_id = f"sse_{request.remote}_{int(asyncio.current_task().get_loop().time())}"
+
+    logger.info(f"SSE request received from {request.remote}", extra={"conn_id": conn_id, "path": request.path, "headers": dict(request.headers)})
+
+    if request.content_type != 'application/json':
+        logger.warning(f"Invalid content type: {request.content_type}", extra={"conn_id": conn_id})
+        raise web.HTTPUnsupportedMediaType(
+            text=json.dumps({"status": "error", "message": "Expected application/json content type."}),
+            content_type="application/json"
+        )
+
+    try:
+        message = await request.json()
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON from SSE request: {e}", exc_info=True, extra={"conn_id": conn_id})
+        raise web.HTTPBadRequest(
+            text=json.dumps({"status": "error", "message": f"Invalid JSON in request body: {e}"}),
+            content_type="application/json"
+        )
+
+    logger.debug(f"Parsed SSE message: {message}", extra={"conn_id": conn_id})
+
+    enabled_tools = request.app["enabled_tools"]
+    bq_job_store = request.app.get("bq_job_store") # Will be None if BQ not enabled
+
+    response_contents = await dispatch_tool(
+        message=message,
+        enabled_tools=enabled_tools,
+        conn_id=conn_id,
+        bq_job_store=bq_job_store
+    )
+
+    # Prepare SSE response. Each Content object becomes a separate event.
+    # The MCP spec usually expects a stream of JSON objects.
+    # aiohttp-sse sends events in the format:
+    # event: <event_name>
+    # data: <json_string_payload>
+    # id: <optional_id>
+    # We'll use the default event name 'message'.
+    async with sse_response(request) as sse_resp:
+        for content_idx, content_obj in enumerate(response_contents):
+            try:
+                if isinstance(content_obj, mcp_types.Content):
+                    payload_str = json.dumps(content_obj.model_dump())
+                else: # Should ideally not happen
+                    logger.error(f"dispatch_tool returned non-Content item: {type(content_obj)}", extra={"conn_id": conn_id})
+                    payload_str = json.dumps(str(content_obj)) # Best effort
+
+                await sse_resp.send(payload_str) # Default event name is 'message'
+                logger.debug(f"Sent SSE event {content_idx + 1}/{len(response_contents)}: {payload_str[:100]}...", extra={"conn_id": conn_id})
+            except Exception as e:
+                logger.error(f"Error serializing or sending SSE event {content_idx}: {e}", exc_info=True, extra={"conn_id": conn_id})
+                # Attempt to send an error event back to the client if the stream is still open
+                try:
+                    error_event_payload = json.dumps({"status": "error", "message": f"Internal error during SSE event generation for event {content_idx}: {str(e)}"})
+                    await sse_resp.send(error_event_payload)
+                except Exception as send_err_exc:
+                    logger.error(f"Failed to send error event back to client: {send_err_exc}", extra={"conn_id": conn_id})
+                    # At this point, the connection might be too broken to continue.
+                    # The sse_response context manager will handle closing.
+                    break
+    return sse_resp # Return the response object
+
+
+async def run_sse_server(
+    enabled_tools: Set[str],
+    host: str,
+    port: int,
+    api_key: Optional[str], # This is the API key value itself, if configured
+    bq_job_store: Optional[FirestoreBqJobStore] = None,
+    **kwargs: Any # Catch-all for future parameters
+) -> None:
+    # If api_key is provided, authentication is active.
+    # The middleware will use app["api_key"] to check against.
+    app = web.Application(middlewares=[api_key_middleware] if api_key else [])
+
+    app["enabled_tools"] = enabled_tools
+    app["api_key"] = api_key # Store the actual API key string for the middleware to use. Could be None.
+    app["bq_job_store"] = bq_job_store
+
+    if api_key:
+        logger.info(f"SSE Server configured WITH API Key Authentication.")
+    else:
+        logger.info(f"SSE Server configured WITHOUT API Key Authentication (no API key provided or --require-api-key not used).")
+
+    app.router.add_post("/mcp", handle_mcp_sse_request)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host, port)
+
+    logger.info(f"Starting SSE server on http://{host}:{port}/mcp")
+    try:
+        await site.start()
+        # Keep server running until interrupted
+        while True:
+            await asyncio.sleep(3600) # Or some other mechanism to keep alive
+    except KeyboardInterrupt:
+        logger.info("SSE server interrupted by user (Ctrl+C).")
+    except Exception as e:
+        logger.critical(f"SSE server failed: {e}", exc_info=True)
+    finally:
+        logger.info("Shutting down SSE server...")
+        await runner.cleanup()
+        logger.info("SSE server has shut down.")

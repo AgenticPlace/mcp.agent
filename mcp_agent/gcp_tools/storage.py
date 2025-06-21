@@ -1,219 +1,254 @@
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Sequence
+from typing import Any, Dict, List, Optional
+from datetime import timedelta, datetime, timezone
 
-from google.cloud import bigquery
-from google.api_core import exceptions as google_exceptions, page_iterator
+from google.cloud import storage
+from google.api_core import exceptions as google_exceptions
 from mcp import types as mcp_types
 
-# REMOVED: ConnectionContextManager import
-from ..job_store import FirestoreBqJobStore # Import Firestore store
-from ..utils import format_success, format_error, format_info, handle_gcp_error, McpToolReturnType
-# Import retry decorator
-from ..utils import retry_on_gcp_transient_error
+try:
+    from ..utils import (
+        format_success, format_error, handle_gcp_error,
+        McpToolReturnType, retry_on_gcp_transient_error
+    )
+except ImportError:
+    logging.critical("Failed to import utils in gcs_tools_temp.py. Ensure PYTHONPATH is correct.")
+    # Define dummy decorators/formatters if utils not found, to allow basic loading
+    def retry_on_gcp_transient_error(func): return func
+    def format_success(msg, data=None): return [mcp_types.TextContent(type="text", text=f'{{"status": "success", "message": "{msg}", "data": {data or {}}}}')]
+    def format_error(msg, data=None): return [mcp_types.TextContent(type="text", text=f'{{"status": "error", "message": "{msg}", "data": {data or {}}}}')]
+    def handle_gcp_error(e, desc): return [mcp_types.TextContent(type="text", text=f'{{"status": "error", "message": "GCP Error in {desc}: {e}"}}')]
+    McpToolReturnType = List[mcp_types.Content]
 
-logger = logging.getLogger("mcp_agent.gcp_tools.bigquery")
 
-_bq_client: Optional[bigquery.Client] = None # Keep client cache
+logger = logging.getLogger("mcp_agent.gcp_tools.storage") # Target logger name
 
-def get_bq_client() -> bigquery.Client:
-    """Initializes returns cached BQ client uses ADC"""
-    # ... (implementation unchanged) ...
-    global _bq_client; # ... init logic ...; return _bq_client
+_storage_client: Optional[storage.Client] = None
 
-# --- Apply Retry Decorator Sync Helpers ---
+def get_storage_client() -> storage.Client:
+    """Initializes and returns a cached GCS client using Application Default Credentials."""
+    global _storage_client
+    if _storage_client is None:
+        logger.info("Initializing Google Cloud Storage client.")
+        try:
+            _storage_client = storage.Client()
+            logger.info("Google Cloud Storage client initialized successfully.")
+        except Exception as e:
+            logger.critical(f"Failed to initialize GCS client: {e}", exc_info=True)
+            raise RuntimeError(f"GCS client initialization failed: {e}") from e
+    return _storage_client
+
+# --- Synchronous helpers with retry ---
 @retry_on_gcp_transient_error
-def _get_dataset_sync(client: bigquery.Client, dataset_ref: bigquery.DatasetReference):
-    logger.debug(f"Running client get dataset thread {dataset_ref} retry")
-    client.get_dataset(dataset_ref)
-
-@retry_on_gcp_transient_error
-def _list_datasets_sync(client: bigquery.Client, project_id: Optional[str]):
-    logger.debug(f"Running client list datasets thread project {project_id or 'default'} retry")
-    return [ds.dataset_id for ds in client.list_datasets(project=project_id)], (project_id or client.project)
-
-@retry_on_gcp_transient_error
-def _list_tables_sync(client: bigquery.Client, dataset_ref: bigquery.DatasetReference):
-    logger.debug(f"Running client list tables thread {dataset_ref} retry")
-    return [table.table_id for table in client.list_tables(dataset_ref)]
-
-@retry_on_gcp_transient_error
-def _get_table_sync(client: bigquery.Client, table_ref: bigquery.TableReference):
-    logger.debug(f"Running client get table thread {table_ref} retry")
-    return client.get_table(table_ref)
-
-@retry_on_gcp_transient_error
-def _submit_job_sync(client: bigquery.Client, query_str: str, job_config: bigquery.QueryJobConfig, project: str):
-    logger.debug(f"Running client query thread project {project} retry")
-    return client.query(query=query_str, job_config=job_config, project=project)
+def _list_buckets_sync(client: storage.Client, project_id: Optional[str]) -> List[str]:
+    logger.debug(f"Running GCS list buckets for project {project_id or 'default client project'}")
+    buckets = client.list_buckets(project=project_id)
+    return [bucket.name for bucket in buckets]
 
 @retry_on_gcp_transient_error
-def _get_job_sync(client: bigquery.Client, job_id: str, location: Optional[str]):
-    logger.debug(f"Running client get job thread {job_id} retry")
-    return client.get_job(job_id, location=location)
+def _list_blobs_sync(client: storage.Client, bucket_name: str, prefix: Optional[str], delimiter: Optional[str]) -> List[Dict[str, Any]]:
+    logger.debug(f"Running GCS list blobs for bucket '{bucket_name}', prefix '{prefix}', delimiter '{delimiter}'")
+    bucket = client.bucket(bucket_name)
+    blobs_iterator = bucket.list_blobs(prefix=prefix, delimiter=delimiter)
+    results = []
+    for blob_item in blobs_iterator:
+        results.append({
+            "name": blob_item.name,
+            "size": blob_item.size,
+            "updated": blob_item.updated.isoformat() if blob_item.updated else None,
+            "content_type": blob_item.content_type
+        })
+    # If delimiter is used, prefixes (virtual folders) are also in blobs_iterator.prefixes
+    if delimiter and hasattr(blobs_iterator, 'prefixes') and blobs_iterator.prefixes:
+        for p in blobs_iterator.prefixes:
+            results.append({"name": p, "type": "prefix"}) # Indicate it's a prefix
+    return results
 
 @retry_on_gcp_transient_error
-def _list_rows_sync(client: bigquery.Client, job_id: str, location: Optional[str], page_token: Optional[str], max_results: int):
-     logger.debug(f"Running client list rows thread page job {job_id} retry")
-     rows_iterator = client.list_rows(job_id, location=location, page_token=page_token, max_results=max_results)
-     page_rows = list(rows_iterator) # Consume page
-     return rows_iterator.schema, page_rows, rows_iterator.next_page_token, rows_iterator.total_rows
+def _upload_string_sync(client: storage.Client, bucket_name: str, object_name: str, content: str, content_type: Optional[str]):
+    logger.debug(f"Running GCS upload string to '{bucket_name}/{object_name}'")
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(object_name)
+    blob.upload_from_string(content, content_type=content_type or 'text/plain')
+    return {"name": blob.name, "bucket": blob.bucket.name, "size": blob.size, "content_type": blob.content_type}
 
-# --- Tool Implementations Require explicit args ---
+@retry_on_gcp_transient_error
+def _generate_signed_url_sync(
+    client: storage.Client,
+    bucket_name: str,
+    object_name: str,
+    method: str,
+    expiration_delta: timedelta,
+    content_type: Optional[str] = None,
+    headers: Optional[Dict[str, str]] = None,
+    version: str = "v4"
+) -> str:
+    logger.debug(f"Generating GCS {method} signed URL for '{bucket_name}/{object_name}', version '{version}'")
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(object_name)
 
-async def bq_list_datasets( arguments: Dict[str, Any], conn_id: str, bq_job_store: FirestoreBqJobStore, **kwargs ) -> McpToolReturnType:
-    """Lists accessible BQ datasets"""
-    project_id = arguments.get("project_id"); # ... type validation ...
-    if project_id is not None and not isinstance(project_id, str): return format_error("Invalid project id must be string")
+    # Ensure expiration is timezone-aware for v4, though timedelta handles it.
+    # The library now prefers timedelta directly for expiration.
+
+    url = blob.generate_signed_url(
+        version=version,
+        expiration=expiration_delta,
+        method=method,
+        content_type=content_type,
+        headers=headers
+    )
+    return url
+
+# --- Async Tool Implementations ---
+
+async def gcs_list_buckets(arguments: Dict[str, Any], conn_id: str, **kwargs) -> McpToolReturnType:
+    project_id = arguments.get("project_id")
+    if project_id is not None and not isinstance(project_id, str):
+        return format_error("Invalid 'project_id', must be a string.")
     try:
-        client = get_bq_client()
-        dataset_list, used_project = await asyncio.to_thread(_list_datasets_sync, client, project_id)
-        return format_success("Datasets listed", data={"project_id": used_project, "datasets": dataset_list})
-    except Exception as e: return handle_gcp_error(e, f"listing BQ datasets project {project_id or 'default'}")
+        client = get_storage_client()
+        bucket_names = await asyncio.to_thread(_list_buckets_sync, client, project_id)
+        return format_success("Buckets listed successfully.", data={"buckets": bucket_names, "project_id": project_id or client.project})
+    except Exception as e:
+        return handle_gcp_error(e, f"listing GCS buckets for project '{project_id or 'default'}'")
 
-async def bq_list_tables( arguments: Dict[str, Any], conn_id: str, bq_job_store: FirestoreBqJobStore, **kwargs ) -> McpToolReturnType:
-    """Lists tables within required BQ dataset"""
-    project_id = arguments.get("project_id"); dataset_id = arguments.get("dataset_id")
-    if not project_id or not isinstance(project_id, str): return format_error("Missing invalid project id")
-    if not dataset_id or not isinstance(dataset_id, str): return format_error("Missing invalid dataset id")
-    try:
-        client = get_bq_client(); dataset_ref = bigquery.DatasetReference(project_id, dataset_id)
-        table_list = await asyncio.to_thread(_list_tables_sync, client, dataset_ref)
-        return format_success("Tables listed", data={"project_id": project_id, "dataset_id": dataset_id, "tables": table_list})
-    except Exception as e: return handle_gcp_error(e, f"listing BQ tables dataset {project_id}:{dataset_id}")
+async def gcs_list_objects(arguments: Dict[str, Any], conn_id: str, **kwargs) -> McpToolReturnType:
+    bucket_name = arguments.get("bucket_name")
+    prefix = arguments.get("prefix")
+    delimiter = arguments.get("delimiter")
 
-async def bq_get_table_schema( arguments: Dict[str, Any], conn_id: str, bq_job_store: FirestoreBqJobStore, **kwargs ) -> McpToolReturnType:
-    """Gets schema required BQ table"""
-    project_id = arguments.get("project_id"); dataset_id = arguments.get("dataset_id"); table_id = arguments.get("table_id")
-    # Simplified validation assumes IDs are mandatory args now
-    if not project_id or not isinstance(project_id, str): return format_error("Missing invalid project id")
-    if not dataset_id or not isinstance(dataset_id, str): return format_error("Missing invalid dataset id")
-    if not table_id or not isinstance(table_id, str): return format_error("Missing invalid table id")
-    # Table ID parsing logic removed assumes simple table ID with required project/dataset args
-    if '.' in table_id: return format_error("Table id should be simple name project dataset provided separately")
-
-    try:
-        client = get_bq_client(); table_ref_str = f"{project_id}.{dataset_id}.{table_id}"
-        table_ref = bigquery.TableReference.from_string(table_ref_str)
-        table = await asyncio.to_thread(_get_table_sync, client, table_ref)
-        schema_list = [{"name": f.name, "type": f.field_type, "mode": f.mode} for f in table.schema]
-        return format_success("Schema retrieved", data={"project_id": table.project, "dataset_id": table.dataset_id, "table_id": table.table_id, "schema": schema_list})
-    except google_exceptions.NotFound: return format_error(f"Table {table_ref_str} not found")
-    except Exception as e: return handle_gcp_error(e, f"getting schema table {table_ref_str}")
-
-async def bq_submit_query( arguments: Dict[str, Any], conn_id: str, bq_job_store: FirestoreBqJobStore, **kwargs ) -> McpToolReturnType:
-    """Submits BQ query job asynchronously returns job ID uses Firestore"""
-    query_str = arguments.get("query"); # ... validation ...
-    if not query_str or not isinstance(query_str, str): return format_error("Missing invalid query string")
-    project_id_arg = arguments.get("project_id"); # ... validation ...
-    default_project_id_arg = arguments.get("default_dataset_project_id"); # ... validation ...
-    default_dataset_id_arg = arguments.get("default_dataset_id"); # ... validation ...
-
-    target_project = project_id_arg # Project run job in
-    job_default_dataset_ref: Optional[bigquery.DatasetReference] = None
-    if default_project_id_arg and default_dataset_id_arg:
-         job_default_dataset_ref = bigquery.DatasetReference(default_project_id_arg, default_dataset_id_arg)
-
-    try:
-        client = get_bq_client();
-        if not target_project: target_project = client.project
-        job_config = bigquery.QueryJobConfig(use_legacy_sql=False);
-        if job_default_dataset_ref: job_config.default_dataset = job_default_dataset_ref
-        logger.info(f"Submitting BQ Job Project {target_project} Query {query_str[:50]}", extra={"conn_id": conn_id})
-        query_job = await asyncio.to_thread(_submit_job_sync, client, query_str, job_config, target_project)
-        job_id = query_job.job_id; location = query_job.location; initial_state = query_job.state
-        logger.info(f"BQ Job submitted {job_id} Location {location} State {initial_state}", extra={"conn_id": conn_id})
-        # --- Store Job Info Firestore ---
-        job_info = BqJobInfo(job_id=job_id, location=location, conn_id=conn_id, status=initial_state)
-        await bq_job_store.add_job(job_info) # Uses Firestore store now
-        # --------------------------------
-        return format_success("Query submitted Use bq get job status poll", data={"job_id": job_id, "location": location, "state": initial_state})
-    except google_exceptions.BadRequest as e: return handle_gcp_error(e, "submitting query BadRequest")
-    except google_exceptions.Forbidden as e: return handle_gcp_error(e, "submitting query Forbidden")
-    except Exception as e: return handle_gcp_error(e, f"submitting BQ query")
-
-async def bq_get_job_status( arguments: Dict[str, Any], conn_id: str, bq_job_store: FirestoreBqJobStore, **kwargs ) -> McpToolReturnType:
-    """Checks job status via Firestore if DONE Success fetches first page results"""
-    job_id = arguments.get("job_id"); # ... validation ...
-    if not job_id or not isinstance(job_id, str): return format_error("Missing invalid job id")
-    # Location arg is mainly for fallback API call if needed now
-    location_arg = arguments.get("location"); # ... validation ...
-
-    logger.debug(f"Getting job status from Firestore {job_id}", extra={"conn_id": conn_id})
-    job_info = await bq_job_store.get_job(job_id) # Reads from Firestore
-
-    if not job_info:
-        # Optional Fallback check BQ API directly if not found in Firestore
-        # logger.warning(f"Job {job_id} not found Firestore trying direct API lookup", extra={"conn_id": conn_id})
-        # try: client=get_bq_client(); job = await asyncio.to_thread(_get_job_sync, client, job_id, location_arg); job_info = BqJobInfo(...) # Reconstruct if needed
-        # except google_exceptions.NotFound: return format_error(...)
-        # except Exception as e: return handle_gcp_error(...)
-        # If still not found after fallback
-        return format_error(f"Job {job_id} not found tracked")
-
-    status_data = {"job_id": job_info.job_id, "location": job_info.location, "state": job_info.status, "error_result": job_info.error_result}
-
-    if job_info.status == 'DONE':
-        if job_info.error_result: return format_error(f"Job {job_id} finished errors", data=status_data)
-        else:
-            # --- Job Done Successfully Fetch FIRST page results ---
-            logger.info(f"Job {job_id} DONE Fetching first page results", extra={"conn_id": conn_id})
-            try:
-                client = get_bq_client(); max_results_first_page = 1000
-                # Use retry wrapped helper fetch page
-                schema, rows, token, total = await asyncio.to_thread(
-                    _list_rows_sync, client, job_id, job_info.location, None, max_results_first_page # page token None
-                )
-                schema_list = [{"name": f.name, "type": f.field_type} for f in schema]; rows_list = [_serialize_row(r) for r in rows]
-                status_data["schema"] = schema_list; status_data["rows"] = rows_list; status_data["next_page_token"] = token; status_data["total_rows"] = total
-                return format_success(f"Job {job_id} completed Returning first page results", data=status_data)
-            except Exception as e:
-                logger.error(f"Error fetching first page results completed job {job_id} {e}", exc_info=True, extra={"conn_id": conn_id})
-                # Return DONE status indicate result fetch error
-                return format_error(f"Job {job_id} completed but failed fetch first page results {e}", data = {**status_data, "rows": None, "schema": None, "next_page_token": None}) # type ignore
-    else:
-        # Job PENDING or RUNNING
-        logger.info(f"Job {job_id} still {job_info.status}", extra={"conn_id": conn_id})
-        return format_info(f"Job {job_id} currently {job_info.status}", data=status_data)
-
-
-async def bq_get_query_results( arguments: Dict[str, Any], conn_id: str, bq_job_store: FirestoreBqJobStore, **kwargs ) -> McpToolReturnType:
-    """Fetches specific page results completed BQ query job requires page token"""
-    job_id = arguments.get("job_id"); page_token = arguments.get("page_token"); location_arg = arguments.get("location")
-    # Validation
-    if not job_id or not isinstance(job_id, str): return format_error("Missing invalid job id")
-    if not page_token or not isinstance(page_token, str): return format_error("Missing invalid required argument page token fetch subsequent pages")
-    if location_arg is not None and not isinstance(location_arg, str): return format_error("Invalid location")
-    try: max_results = int(arguments.get("max_results", 1000)); # ... range check ...
-    except (ValueError, TypeError): max_results = 1000
-
-    # Determine location argument > stored job info > error
-    location = location_arg
-    if not location:
-        job_info = await bq_job_store.get_job(job_id) # Read from Firestore
-        if job_info: location = job_info.location
-        else: return format_error(f"Cannot fetch results page Location job {job_id} unknown Please provide location")
-    if not location: return format_error(f"Cannot fetch results page Location job {job_id} could not be determined")
+    if not bucket_name or not isinstance(bucket_name, str):
+        return format_error("Missing or invalid 'bucket_name' argument.")
+    if prefix is not None and not isinstance(prefix, str):
+        return format_error("Invalid 'prefix' argument, must be a string.")
+    if delimiter is not None and not isinstance(delimiter, str):
+        return format_error("Invalid 'delimiter' argument, must be a string.")
 
     try:
-        client = get_bq_client()
-        logger.debug(f"Getting results page BQ job {job_id} Loc {location} PageToken {page_token[:10]}", extra={"conn_id": conn_id})
-        # Fetch requested page retry wrapped helper
-        schema, rows, token, total = await asyncio.to_thread(
-            _list_rows_sync, client, job_id, location, page_token, max_results
+        client = get_storage_client()
+        objects = await asyncio.to_thread(_list_blobs_sync, client, bucket_name, prefix, delimiter)
+        return format_success(f"Objects listed for bucket '{bucket_name}'.", data={"bucket_name": bucket_name, "objects": objects})
+    except google_exceptions.NotFound:
+        return format_error(f"Bucket '{bucket_name}' not found.")
+    except Exception as e:
+        return handle_gcp_error(e, f"listing objects in GCS bucket '{bucket_name}'")
+
+async def gcs_get_read_signed_url(arguments: Dict[str, Any], conn_id: str, **kwargs) -> McpToolReturnType:
+    bucket_name = arguments.get("bucket_name")
+    object_name = arguments.get("object_name")
+    expiration_minutes = arguments.get("expiration_minutes", 60) # Default to 60 minutes
+
+    if not bucket_name or not isinstance(bucket_name, str):
+        return format_error("Missing or invalid 'bucket_name'.")
+    if not object_name or not isinstance(object_name, str):
+        return format_error("Missing or invalid 'object_name'.")
+    try:
+        expiration_minutes = int(expiration_minutes)
+        if expiration_minutes <= 0 or expiration_minutes > 7 * 24 * 60: # Max 7 days for v4
+             raise ValueError("Expiration must be between 1 minute and 7 days (10080 minutes).")
+    except ValueError:
+        return format_error("Invalid 'expiration_minutes', must be a positive integer (max 10080).")
+
+    try:
+        client = get_storage_client()
+        expiration_delta = timedelta(minutes=expiration_minutes)
+
+        # For GET, content_type and headers are usually not needed for the URL itself
+        # unless specific response headers are desired from GCS (response_disposition, etc.)
+        # which can be passed via `response_disposition` or `response_type` to generate_signed_url.
+        # For simplicity, we are not including them here unless a specific need arises.
+
+        signed_url = await asyncio.to_thread(
+            _generate_signed_url_sync,
+            client, bucket_name, object_name, "GET", expiration_delta, version="v4"
         )
-        schema_list = [{"name": f.name, "type": f.field_type} for f in schema]; rows_list = [_serialize_row(r) for r in rows]
-        return format_success("Query results page retrieved", data={"job_id": job_id, "location": location, "schema": schema_list, "rows": rows_list, "next_page_token": token, "total_rows": total})
-    except google_exceptions.NotFound: return format_error(f"Job {job_id} not found or invalid page token")
-    except Exception as e: return handle_gcp_error(e, f"getting results page job {job_id}")
+        return format_success("Read signed URL generated.", data={
+            "bucket_name": bucket_name,
+            "object_name": object_name,
+            "signed_url": signed_url,
+            "method": "GET",
+            "expires_at": (datetime.now(timezone.utc) + expiration_delta).isoformat()
+        })
+    except google_exceptions.NotFound: # Bucket or blob might not exist, though URL can still be generated
+        logger.warning(f"GCS Read Signed URL: Bucket '{bucket_name}' or object '{object_name}' may not exist, but URL generated.", exc_info=False)
+        # Depending on strictness, one might error here or let the client discover the 404.
+        # For now, let the URL be generated; the client will get a 404 if the object doesn't exist.
+        # Re-raising to be caught by handle_gcp_error if that's the desired behavior for non-existence.
+        # However, generate_signed_url itself doesn't check existence.
+        # Let's assume the primary error source would be IAM for token creation.
+        return format_error(f"Could not generate read signed URL. Ensure bucket '{bucket_name}' and object '{object_name}' exist if access fails, or check IAM permissions for the service account (needs Service Account Token Creator on itself).")
+
+    except Exception as e:
+        return handle_gcp_error(e, f"generating read signed URL for '{bucket_name}/{object_name}'")
 
 
-def _serialize_row(row: bigquery.table.Row) -> Dict[str, Any]:
-    """Helper convert BQ Row JSON serializable dict"""
-    row_dict = {}; # ... implementation unchanged ...
-    for key, value in row.items():
-         if isinstance(value, bytes):
-             try: row_dict[key] = value.decode('utf-8')
-             except UnicodeDecodeError: row_dict[key] = f"<bytes:{len(value)}>"
-         else: row_dict[key] = value
-    return row_dict
+async def gcs_get_write_signed_url(arguments: Dict[str, Any], conn_id: str, **kwargs) -> McpToolReturnType:
+    bucket_name = arguments.get("bucket_name")
+    object_name = arguments.get("object_name")
+    expiration_minutes = arguments.get("expiration_minutes", 60) # Default to 60 minutes
+    content_type = arguments.get("content_type") # Optional, e.g., 'application/octet-stream' or 'image/jpeg'
+    custom_headers = arguments.get("headers") # Optional custom headers like 'x-goog-meta-*'
+
+    if not bucket_name or not isinstance(bucket_name, str):
+        return format_error("Missing or invalid 'bucket_name'.")
+    if not object_name or not isinstance(object_name, str):
+        return format_error("Missing or invalid 'object_name'.")
+    if content_type is not None and not isinstance(content_type, str):
+        return format_error("Invalid 'content_type', must be a string if provided.")
+    if custom_headers is not None and not isinstance(custom_headers, dict):
+        return format_error("Invalid 'headers', must be a dictionary if provided.")
+
+    try:
+        expiration_minutes = int(expiration_minutes)
+        if expiration_minutes <= 0 or expiration_minutes > 7 * 24 * 60:
+             raise ValueError("Expiration must be between 1 minute and 7 days (10080 minutes).")
+    except ValueError:
+        return format_error("Invalid 'expiration_minutes', must be a positive integer (max 10080).")
+
+    try:
+        client = get_storage_client()
+        expiration_delta = timedelta(minutes=expiration_minutes)
+
+        signed_url = await asyncio.to_thread(
+            _generate_signed_url_sync,
+            client, bucket_name, object_name, "PUT", expiration_delta,
+            content_type=content_type, headers=custom_headers, version="v4"
+        )
+        return format_success("Write signed URL generated.", data={
+            "bucket_name": bucket_name,
+            "object_name": object_name,
+            "signed_url": signed_url,
+            "method": "PUT",
+            "content_type_expected": content_type, # Client should use this Content-Type header
+            "custom_headers_expected": custom_headers, # Client should include these headers
+            "expires_at": (datetime.now(timezone.utc) + expiration_delta).isoformat()
+        })
+    except Exception as e: # Catch broad exceptions, including potential IAM issues for SA Token Creator
+        return handle_gcp_error(e, f"generating write signed URL for '{bucket_name}/{object_name}'")
+
+async def gcs_write_string_object(arguments: Dict[str, Any], conn_id: str, **kwargs) -> McpToolReturnType:
+    bucket_name = arguments.get("bucket_name")
+    object_name = arguments.get("object_name")
+    content = arguments.get("content")
+    content_type = arguments.get("content_type") # Optional
+
+    if not bucket_name or not isinstance(bucket_name, str):
+        return format_error("Missing or invalid 'bucket_name'.")
+    if not object_name or not isinstance(object_name, str):
+        return format_error("Missing or invalid 'object_name'.")
+    if content is None or not isinstance(content, str): # Content must be string for this tool
+        return format_error("Missing or invalid 'content', must be a string.")
+    if content_type is not None and not isinstance(content_type, str):
+        return format_error("Invalid 'content_type', must be a string if provided.")
+
+    try:
+        client = get_storage_client()
+        upload_result = await asyncio.to_thread(
+            _upload_string_sync, client, bucket_name, object_name, content, content_type
+        )
+        return format_success(f"String content written to '{bucket_name}/{object_name}'.", data=upload_result)
+    except google_exceptions.NotFound:
+        return format_error(f"Bucket '{bucket_name}' not found.")
+    except Exception as e:
+        return handle_gcp_error(e, f"writing string to GCS object '{bucket_name}/{object_name}'")

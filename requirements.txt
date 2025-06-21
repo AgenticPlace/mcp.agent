@@ -7,6 +7,8 @@ google-cloud-secret-manager >= 2.10.0
 python-dotenv >= 1.0.0
 python-json-logger >= 2.0.0
 tenacity >= 8.0.0
+aiohttp >= 3.8.0 # For SSE server
+aiohttp-sse >= 2.1.0 # For SSE event streaming
 
 # Notes:
 # - Specify exact versions if needed for strict reproducibility (e.g., ==2.5.0).

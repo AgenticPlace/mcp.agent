@@ -1,140 +1,108 @@
 # mcp_agent/gcp_tools/__init__.py
-# Make tools easily importable
-from .storage import (
-    gcs_list_buckets,
-    gcs_set_context_bucket,
-    gcs_clear_context_bucket,
-    gcs_list_objects,
-    gcs_read_object,
-    gcs_write_object,
-)
-from .bigquery import (
-    bq_set_context_dataset,
-    bq_clear_context_dataset,
-    bq_list_datasets,
-    bq_list_tables,
-    bq_get_table_schema,
-    bq_query,
-)
+# This file defines the available GCP tools for the MCP agent.
 
-# Define tool schemas for MCP advertisement
+import logging
+from typing import Dict, Callable, Awaitable, List
 from mcp import types as mcp_types
 
-# Schemas can be complex, defining them manually here for clarity
-# In a real app, you might generate these from function signatures or dataclasses
+logger = logging.getLogger("mcp_agent.gcp_tools")
 
-GCS_TOOLS_SCHEMAS = [
-    mcp_types.Tool(
-        name="gcs_list_buckets",
-        description="Lists accessible Google Cloud Storage buckets.",
-        arguments={},
-    ),
-    mcp_types.Tool(
-        name="gcs_set_context_bucket",
-        description="Sets the default GCS bucket for subsequent commands in this session.",
-        arguments={
-            "bucket_name": mcp_types.ToolArgument(
-                type="string", description="The name of the GCS bucket.", is_required=True
-            )
-        },
-    ),
-     mcp_types.Tool(
-        name="gcs_clear_context_bucket",
-        description="Clears the default GCS bucket context for this session.",
-        arguments={},
-    ),
-    mcp_types.Tool(
-        name="gcs_list_objects",
-        description="Lists objects and common prefixes (directories) in a GCS bucket. Uses context bucket if 'bucket_name' is omitted. Supports pagination.",
-        arguments={
-            "bucket_name": mcp_types.ToolArgument(type="string", description="Specific bucket name (overrides context).", is_required=False),
-            "prefix": mcp_types.ToolArgument(type="string", description="Filter results by this prefix (e.g., 'images/').", is_required=False),
-            "page_token": mcp_types.ToolArgument(type="string", description="Token from a previous response to get the next page.", is_required=False),
-            "max_results": mcp_types.ToolArgument(type="integer", description="Maximum items per page.", is_required=False, default_value=100),
-        },
-    ),
-    mcp_types.Tool(
-        name="gcs_read_object",
-        description="Reads the content of an object in a GCS bucket. Uses context bucket if 'bucket_name' is omitted.",
-        arguments={
-            "object_path": mcp_types.ToolArgument(type="string", description="The full path to the object within the bucket.", is_required=True),
-            "bucket_name": mcp_types.ToolArgument(type="string", description="Specific bucket name (overrides context).", is_required=False),
-        },
-    ),
-     mcp_types.Tool(
-        name="gcs_write_object",
-        description="Writes string content to an object in a GCS bucket. Uses context bucket if 'bucket_name' is omitted. Overwrites if exists.",
-        arguments={
-            "object_path": mcp_types.ToolArgument(type="string", description="The full path for the object within the bucket.", is_required=True),
-            "content": mcp_types.ToolArgument(type="string", description="The string content to write.", is_required=True),
-            "bucket_name": mcp_types.ToolArgument(type="string", description="Specific bucket name (overrides context).", is_required=False),
-        },
-    ),
-]
+# Import tool functions from their respective modules
+# Note: These imports assume the functions are defined in these files.
+# If a function isn't found, it means it hasn't been implemented or is misnamed.
+try:
+    from .storage import (
+        gcs_list_buckets,
+        gcs_list_objects,
+        gcs_get_read_signed_url,
+        gcs_get_write_signed_url,
+        gcs_write_string_object,
+        # get_storage_client # Typically not a tool itself, but a helper
+    )
+    logger.debug("Successfully imported GCS tools from .storage")
+except ImportError as e:
+    logger.error(f"Error importing GCS tools from .storage: {e}. Some GCS tools may not be available.", exc_info=True)
+    # Define placeholders if import fails to prevent server from crashing on ALL_TOOLS_MAP access
+    def _gcs_placeholder(*args, **kwargs): raise NotImplementedError("GCS tool not loaded due to import error")
+    gcs_list_buckets = gcs_list_objects = gcs_get_read_signed_url = _gcs_placeholder
+    gcs_get_write_signed_url = gcs_write_string_object = _gcs_placeholder
 
-BQ_TOOLS_SCHEMAS = [
-    mcp_types.Tool(
-        name="bq_set_context_dataset",
-        description="Sets the default BigQuery project and dataset for subsequent commands.",
-        arguments={
-            "project_id": mcp_types.ToolArgument(type="string", description="The Google Cloud project ID.", is_required=True),
-            "dataset_id": mcp_types.ToolArgument(type="string", description="The BigQuery dataset ID.", is_required=True),
-        },
-    ),
-     mcp_types.Tool(
-        name="bq_clear_context_dataset",
-        description="Clears the default BigQuery project/dataset context.",
-        arguments={},
-    ),
-     mcp_types.Tool(
-        name="bq_list_datasets",
-        description="Lists accessible BigQuery datasets within a project.",
-        arguments={
-            "project_id": mcp_types.ToolArgument(type="string", description="Specific project ID (defaults to server's default project if omitted).", is_required=False),
-        },
-    ),
-     mcp_types.Tool(
-        name="bq_list_tables",
-        description="Lists tables within a BigQuery dataset. Uses context if project/dataset IDs are omitted.",
-        arguments={
-             "project_id": mcp_types.ToolArgument(type="string", description="Specific project ID (overrides context).", is_required=False),
-             "dataset_id": mcp_types.ToolArgument(type="string", description="Specific dataset ID (overrides context).", is_required=False),
-        },
-    ),
-    mcp_types.Tool(
-        name="bq_get_table_schema",
-        description="Gets the schema of a BigQuery table. Uses context project/dataset if IDs are omitted.",
-        arguments={
-            "table_id": mcp_types.ToolArgument(type="string", description="Table ID (e.g., 'my_table' or 'dataset.my_table').", is_required=True),
-            "project_id": mcp_types.ToolArgument(type="string", description="Specific project ID (overrides context).", is_required=False),
-            "dataset_id": mcp_types.ToolArgument(type="string", description="Specific dataset ID (overrides context).", is_required=False),
-        },
-    ),
-    mcp_types.Tool(
-        name="bq_query",
-        description="Executes a SQL query in BigQuery. Uses context project/dataset for unqualified table names.",
-        arguments={
-            "query": mcp_types.ToolArgument(type="string", description="The SQL query string.", is_required=True),
-            "project_id": mcp_types.ToolArgument(type="string", description="Project ID to run the query in (overrides context default project).", is_required=False),
-            "dataset_id": mcp_types.ToolArgument(type="string", description="Default dataset ID for unqualified table names (overrides context default dataset).", is_required=False),
-            "max_results": mcp_types.ToolArgument(type="integer", description="Maximum rows to return in the first page.", is_required=False, default_value=1000),
-            "page_token": mcp_types.ToolArgument(type="string", description="Page token from a previous query result to fetch the next page.", is_required=False),
-        },
-    ),
-]
 
-# Map tool names to functions
-ALL_TOOLS_MAP = {
+try:
+    from .bigquery import (
+        bq_list_datasets,
+        bq_list_tables,
+        bq_get_table_schema,
+        bq_submit_query,
+        bq_get_job_status,
+        bq_get_query_results,
+        # get_bq_client # Typically not a tool itself
+    )
+    logger.debug("Successfully imported BigQuery tools from .bigquery")
+except ImportError as e:
+    logger.error(f"Error importing BQ tools from .bigquery: {e}. Some BQ tools may not be available.", exc_info=True)
+    def _bq_placeholder(*args, **kwargs): raise NotImplementedError("BQ tool not loaded due to import error")
+    bq_list_datasets = bq_list_tables = bq_get_table_schema = _bq_placeholder
+    bq_submit_query = bq_get_job_status = bq_get_query_results = _bq_placeholder
+
+
+# ALL_TOOLS_MAP: Maps tool names (as called by MCP client) to their async function implementations.
+# Each function is expected to take `arguments: Dict[str, Any], conn_id: str, **kwargs`
+# and return `McpToolReturnType` (which is `List[mcp_types.Content]`).
+# The `bq_job_store` will be passed in kwargs by the dispatcher if available.
+ALL_TOOLS_MAP: Dict[str, Callable[..., Awaitable[List[mcp_types.Content]]]] = {
+    # GCS Tools
     "gcs_list_buckets": gcs_list_buckets,
-    "gcs_set_context_bucket": gcs_set_context_bucket,
-    "gcs_clear_context_bucket": gcs_clear_context_bucket,
     "gcs_list_objects": gcs_list_objects,
-    "gcs_read_object": gcs_read_object,
-    "gcs_write_object": gcs_write_object,
-    "bq_set_context_dataset": bq_set_context_dataset,
-    "bq_clear_context_dataset": bq_clear_context_dataset,
+    "gcs_get_read_signed_url": gcs_get_read_signed_url,
+    "gcs_get_write_signed_url": gcs_get_write_signed_url,
+    "gcs_write_string_object": gcs_write_string_object,
+
+    # BigQuery Tools
     "bq_list_datasets": bq_list_datasets,
     "bq_list_tables": bq_list_tables,
     "bq_get_table_schema": bq_get_table_schema,
-    "bq_query": bq_query,
+    "bq_submit_query": bq_submit_query,
+    "bq_get_job_status": bq_get_job_status,
+    "bq_get_query_results": bq_get_query_results,
 }
+
+logger.info(f"ALL_TOOLS_MAP initialized with {len(ALL_TOOLS_MAP)} tools: {list(ALL_TOOLS_MAP.keys())}")
+
+# TODO: Define MCP Tool Schemas for advertisement (Priority 4 - Documentation)
+# These schemas describe the tools, their arguments, and descriptions for MCP clients.
+# Example structure:
+# from mcp import types as mcp_types
+# TOOL_SCHEMAS: List[mcp_types.Tool] = [
+#     mcp_types.Tool(
+#         name="gcs_list_buckets",
+#         description="Lists accessible Google Cloud Storage buckets.",
+#         arguments={
+#             "project_id": mcp_types.ToolArgument(type="string", description="Optional GCP project ID.", is_required=False)
+#         }
+#     ),
+#     # ... other tool schemas ...
+# ]
+# For now, this part is deferred. The server will function using ALL_TOOLS_MAP for dispatch.
+# Client-side tool discovery and argument validation will be limited until schemas are provided.
+
+# Ensure base.py is not directly exporting tools unless intended.
+# It might contain base classes or shared utilities for tools.
+from . import base
+# If base.py has tool definitions, they should be explicitly imported and added to map.
+# For now, assuming tools are in storage.py and bigquery.py.
+
+# Clean up namespace if placeholders were defined due to import errors,
+# though a better approach is to let the server fail on startup if core tools can't load.
+# This cleanup is more for robustness if some non-critical tools failed to import.
+_placeholders_to_remove = []
+for tool_name, func in ALL_TOOLS_MAP.items():
+    if hasattr(func, '__name__') and func.__name__ in ["_gcs_placeholder", "_bq_placeholder"]:
+        _placeholders_to_remove.append(tool_name)
+
+if _placeholders_to_remove:
+    logger.warning(f"Removing placeholder tools due to import errors: {_placeholders_to_remove}")
+    for tool_name in _placeholders_to_remove:
+        del ALL_TOOLS_MAP[tool_name]
+
+logger.info(f"Final ALL_TOOLS_MAP contains {len(ALL_TOOLS_MAP)} actively loaded tools.")
