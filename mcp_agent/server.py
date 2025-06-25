@@ -148,7 +148,7 @@ async def handle_mcp_sse_request(request: web.Request):
     # Generate a somewhat unique connection ID for logging/tracing this request
     conn_id = request.headers.get("X-Connection-ID") # Allow client to specify
     if not conn_id:
-        conn_id = f"sse_{request.remote}_{int(asyncio.current_task().get_loop().time())}"
+        conn_id = f"sse_{request.remote}_{int(asyncio.get_running_loop().time())}"
 
     logger.info(f"SSE request received from {request.remote}", extra={"conn_id": conn_id, "path": request.path, "headers": dict(request.headers)})
 
