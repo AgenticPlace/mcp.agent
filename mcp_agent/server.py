@@ -244,7 +244,7 @@ async def run_sse_server(
         await site.start()
         # Keep server running until interrupted
         while True:
-            await asyncio.sleep(3600) # Or some other mechanism to keep alive
+            await asyncio.Future() # Wait indefinitely until cancelled
     except KeyboardInterrupt:
         logger.info("SSE server interrupted by user (Ctrl+C).")
     except Exception as e:
