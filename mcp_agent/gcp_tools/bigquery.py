@@ -17,9 +17,17 @@ logger = logging.getLogger("mcp_agent.gcp_tools.bigquery")
 _bq_client: Optional[bigquery.Client] = None # Keep client cache
 
 def get_bq_client() -> bigquery.Client:
-    """Initializes returns cached BQ client uses ADC"""
-    # ... (implementation unchanged) ...
-    global _bq_client; # ... init logic ...; return _bq_client
+    """Initializes and returns a cached BigQuery client using Application Default Credentials."""
+    global _bq_client
+    if _bq_client is None:
+        logger.info("Initializing Google Cloud BigQuery client.")
+        try:
+            _bq_client = bigquery.Client()
+            logger.info("Google Cloud BigQuery client initialized successfully.")
+        except Exception as e:
+            logger.critical(f"Failed to initialize BigQuery client: {e}", exc_info=True)
+            raise RuntimeError(f"BigQuery client initialization failed: {e}") from e
+    return _bq_client
 
 # --- Apply Retry Decorator Sync Helpers ---
 @retry_on_gcp_transient_error
