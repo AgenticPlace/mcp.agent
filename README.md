@@ -198,4 +198,4 @@ This project is currently a proof-of-concept. While formal contributions are not
 
 ## License
 
-(Example: Apache License 2.0 - Please replace with your chosen license)
+This product is licenced to work with Google Cloud Apache License 2.0 in association with BANKON (c) 2025 BANKON all rights preserved
